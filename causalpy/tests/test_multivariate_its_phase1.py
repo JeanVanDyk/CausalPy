@@ -222,7 +222,7 @@ def test_formula_stored_correctly(simple_data):
         formula=formula_str,
         model=LinearRegression(),
     )
-    assert result.formula == formula_str
+    assert result.formula == [formula_str]
 
     formula_list = ["y1 ~ 1 + t", "y2 ~ 1 + t"]
     result = cp.InterruptedTimeSeries(
