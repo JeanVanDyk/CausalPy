@@ -164,8 +164,15 @@ class InterruptedTimeSeries(BaseExperiment):
         self._x_design_info_list: list = []
         self.outcome_variable_names: list[str] = []
 
+        # Parse all formulas and collect y and X arrays for each outcome
+        pre_y_list: list[np.ndarray] = []
+        pre_X_list: list[np.ndarray] = []
+        post_y_list: list[np.ndarray] = []
+        post_X_list: list[np.ndarray] = []
+
         for f in self.formula:
             try:
+                # Parse pre-intervention data
                 y, X = dmatrices(f, self.datapre)
             except Exception as e:
                 raise FormulaException(f"Error parsing formula '{f}': {str(e)}") from e
@@ -178,88 +185,131 @@ class InterruptedTimeSeries(BaseExperiment):
             outcome_name = y.design_info.column_names[0]
             self.outcome_variable_names.append(outcome_name)
 
-        # Parse first formula for pre-intervention data (Phase 1.2 will handle multivariate properly)
-        y, X = dmatrices(self.formula[0], self.datapre)
-        self.pre_y, self.pre_X = np.asarray(y), np.asarray(X)
-        # process post-intervention data
-        (new_y, new_x) = build_design_matrices(
-            [self._y_design_info_list[0], self._x_design_info_list[0]], self.datapost
-        )
-        self.post_X = np.asarray(new_x)
-        self.post_y = np.asarray(new_y)
-        # turn into xarray.DataArray's
-        self.pre_X = xr.DataArray(
-            self.pre_X,
-            dims=["obs_ind", "coeffs"],
+            # Store pre-intervention arrays
+            pre_y_list.append(np.asarray(y))
+            pre_X_list.append(np.asarray(X))
+
+            # Process post-intervention data
+            (new_y, new_x) = build_design_matrices(
+                [y.design_info, X.design_info], self.datapost
+            )
+            post_y_list.append(np.asarray(new_y))
+            post_X_list.append(np.asarray(new_x))
+
+        # Create pre_y and post_y as xarray DataArrays with "outcomes" dimension
+        # Stack all y arrays: shape (n_obs, n_outcomes)
+        pre_y_stacked = np.hstack(pre_y_list)  # Shape: (n_obs, n_outcomes)
+        post_y_stacked = np.hstack(post_y_list)  # Shape: (n_post_obs, n_outcomes)
+
+        self.pre_y = xr.DataArray(
+            pre_y_stacked,
+            dims=["obs_ind", "outcomes"],
             coords={
                 "obs_ind": self.datapre.index,
-                "coeffs": self._x_design_info_list[0].column_names,
-            },
-        )
-        self.pre_y = xr.DataArray(
-            self.pre_y,  # Keep 2D shape
-            dims=["obs_ind", "treated_units"],
-            coords={"obs_ind": self.datapre.index, "treated_units": ["unit_0"]},
-        )
-        self.post_X = xr.DataArray(
-            self.post_X,
-            dims=["obs_ind", "coeffs"],
-            coords={
-                "obs_ind": self.datapost.index,
-                "coeffs": self._x_design_info_list[0].column_names,
+                "outcomes": self.outcome_variable_names,
             },
         )
         self.post_y = xr.DataArray(
-            self.post_y,  # Keep 2D shape
-            dims=["obs_ind", "treated_units"],
-            coords={"obs_ind": self.datapost.index, "treated_units": ["unit_0"]},
+            post_y_stacked,
+            dims=["obs_ind", "outcomes"],
+            coords={
+                "obs_ind": self.datapost.index,
+                "outcomes": self.outcome_variable_names,
+            },
         )
 
+        # Create pre_X and post_X as lists of DataArrays (one per outcome)
+        # Each outcome can have different predictors (different number of coefficients)
+        self.pre_X: list[xr.DataArray] = []
+        self.post_X: list[xr.DataArray] = []
+
+        for X_pre, X_post, x_design_info in zip(
+            pre_X_list, post_X_list, self._x_design_info_list, strict=True
+        ):
+            self.pre_X.append(
+                xr.DataArray(
+                    X_pre,
+                    dims=["obs_ind", "coeffs"],
+                    coords={
+                        "obs_ind": self.datapre.index,
+                        "coeffs": x_design_info.column_names,
+                    },
+                )
+            )
+            self.post_X.append(
+                xr.DataArray(
+                    X_post,
+                    dims=["obs_ind", "coeffs"],
+                    coords={
+                        "obs_ind": self.datapost.index,
+                        "coeffs": x_design_info.column_names,
+                    },
+                )
+            )
+
         # fit the model to the observed (pre-intervention) data
+        # For Phase 1.2: Use first outcome for backward compatibility (Phase 2 will handle multivariate)
         # All PyMC models now accept xr.DataArray with consistent API
+
+        # Get first X array (always a list, use first element)
+        pre_X_first = self.pre_X[0]
+        post_X_first = self.post_X[0]
+        coeffs_names = self._x_design_info_list[0].column_names
+        n_obs = pre_X_first.shape[0]
+
         if isinstance(self.model, PyMCModel):
             COORDS: dict[str, Any] = {
-                "coeffs": self._x_design_info_list[0].column_names,
-                "obs_ind": np.arange(self.pre_X.shape[0]),
-                "treated_units": ["unit_0"],
+                "coeffs": coeffs_names,
+                "obs_ind": np.arange(n_obs),
+                "outcomes": self.outcome_variable_names,
                 "datetime_index": self.datapre.index,  # For time series models
             }
-            self.model.fit(X=self.pre_X, y=self.pre_y, coords=COORDS)
+            # For now, use first outcome (Phase 2 will handle multivariate properly)
+            self.model.fit(
+                X=pre_X_first,
+                y=self.pre_y.sel(outcomes=self.outcome_variable_names[0]),
+                coords=COORDS,
+            )
         elif isinstance(self.model, RegressorMixin):
-            # For OLS models, use 1D y data
-            self.model.fit(X=self.pre_X, y=self.pre_y.isel(treated_units=0))
+            # For OLS models, use 1D y data (first outcome for now)
+            self.model.fit(
+                X=pre_X_first, y=self.pre_y.sel(outcomes=self.outcome_variable_names[0])
+            )
         else:
             raise ValueError("Model type not recognized")
 
         # score the goodness of fit to the pre-intervention data
-        if isinstance(self.model, PyMCModel):
-            self.score = self.model.score(X=self.pre_X, y=self.pre_y)
-        elif isinstance(self.model, RegressorMixin):
+        if isinstance(self.model, (PyMCModel, RegressorMixin)):
             self.score = self.model.score(
-                X=self.pre_X, y=self.pre_y.isel(treated_units=0)
+                X=pre_X_first, y=self.pre_y.sel(outcomes=self.outcome_variable_names[0])
             )
 
         # get the model predictions of the observed (pre-intervention) data
         if isinstance(self.model, (PyMCModel, RegressorMixin)):
-            self.pre_pred = self.model.predict(X=self.pre_X)
+            self.pre_pred = self.model.predict(X=pre_X_first)
 
         # calculate the counterfactual (post period)
         if isinstance(self.model, PyMCModel):
-            self.post_pred = self.model.predict(X=self.post_X, out_of_sample=True)
+            self.post_pred = self.model.predict(X=post_X_first, out_of_sample=True)
         elif isinstance(self.model, RegressorMixin):
-            self.post_pred = self.model.predict(X=self.post_X)
+            self.post_pred = self.model.predict(X=post_X_first)
 
-        # calculate impact - all PyMC models now use 2D data with treated_units
+        # calculate impact - all PyMC models now use 2D data with outcomes dimension
+        # For Phase 1.2: Use first outcome (Phase 2 will handle multivariate properly)
         if isinstance(self.model, PyMCModel):
-            self.pre_impact = self.model.calculate_impact(self.pre_y, self.pre_pred)
-            self.post_impact = self.model.calculate_impact(self.post_y, self.post_pred)
+            self.pre_impact = self.model.calculate_impact(
+                self.pre_y.sel(outcomes=self.outcome_variable_names[0]), self.pre_pred
+            )
+            self.post_impact = self.model.calculate_impact(
+                self.post_y.sel(outcomes=self.outcome_variable_names[0]), self.post_pred
+            )
         elif isinstance(self.model, RegressorMixin):
             # SKL models work with 1D data
             self.pre_impact = self.model.calculate_impact(
-                self.pre_y.isel(treated_units=0), self.pre_pred
+                self.pre_y.sel(outcomes=self.outcome_variable_names[0]), self.pre_pred
             )
             self.post_impact = self.model.calculate_impact(
-                self.post_y.isel(treated_units=0), self.post_pred
+                self.post_y.sel(outcomes=self.outcome_variable_names[0]), self.post_pred
             )
 
         self.post_impact_cumulative = self.model.calculate_cumulative_impact(
@@ -829,8 +879,8 @@ class InterruptedTimeSeries(BaseExperiment):
 
         (h,) = ax[0].plot(
             self.datapre.index,
-            self.pre_y.isel(treated_units=0)
-            if hasattr(self.pre_y, "isel")
+            self.pre_y.sel(outcomes=self.outcome_variable_names[0])
+            if hasattr(self.pre_y, "sel")
             else self.pre_y[:, 0],
             "k.",
             label="Observations",
@@ -841,8 +891,8 @@ class InterruptedTimeSeries(BaseExperiment):
         # post intervention period
         post_mu = self.post_pred["posterior_predictive"].mu
         post_mu_plot = (
-            post_mu.isel(treated_units=0)
-            if "treated_units" in post_mu.dims
+            post_mu.sel(outcomes=self.outcome_variable_names[0])
+            if "outcomes" in post_mu.dims
             else post_mu
         )
         h_line, h_patch = plot_xY(
@@ -856,8 +906,8 @@ class InterruptedTimeSeries(BaseExperiment):
 
         ax[0].plot(
             self.datapost.index,
-            self.post_y.isel(treated_units=0)
-            if hasattr(self.post_y, "isel")
+            self.post_y.sel(outcomes=self.outcome_variable_names[0])
+            if hasattr(self.post_y, "sel")
             else self.post_y[:, 0],
             "k.",
         )
@@ -865,14 +915,14 @@ class InterruptedTimeSeries(BaseExperiment):
         post_pred_mu = az.extract(
             self.post_pred, group="posterior_predictive", var_names="mu"
         )
-        if "treated_units" in post_pred_mu.dims:
-            post_pred_mu = post_pred_mu.isel(treated_units=0)
+        if "outcomes" in post_pred_mu.dims:
+            post_pred_mu = post_pred_mu.sel(outcomes=self.outcome_variable_names[0])
         post_pred_mu = post_pred_mu.mean("sample")
         h = ax[0].fill_between(
             self.datapost.index,
             y1=post_pred_mu,
-            y2=self.post_y.isel(treated_units=0)
-            if hasattr(self.post_y, "isel")
+            y2=self.post_y.sel(outcomes=self.outcome_variable_names[0])
+            if hasattr(self.post_y, "sel")
             else self.post_y[:, 0],
             color="C0",
             alpha=0.25,
@@ -1009,10 +1059,18 @@ class InterruptedTimeSeries(BaseExperiment):
 
         fig, ax = plt.subplots(3, 1, sharex=True, figsize=(7, 8))
 
-        ax[0].plot(self.datapre.index, self.pre_y, "k.")
+        ax[0].plot(
+            self.datapre.index,
+            self.pre_y.sel(outcomes=self.outcome_variable_names[0]),
+            "k.",
+        )
         ax[0].plot(self.datapre.index, self.pre_pred, c="k", label="model fit")
 
-        ax[0].plot(self.datapost.index, self.post_y, "k.")
+        ax[0].plot(
+            self.datapost.index,
+            self.post_y.sel(outcomes=self.outcome_variable_names[0]),
+            "k.",
+        )
         ax[0].plot(
             self.datapost.index,
             self.post_pred,
@@ -1024,7 +1082,7 @@ class InterruptedTimeSeries(BaseExperiment):
         ax[0].fill_between(
             self.datapost.index,
             y1=np.squeeze(self.post_pred),
-            y2=np.squeeze(self.post_y),
+            y2=np.squeeze(self.post_y.sel(outcomes=self.outcome_variable_names[0])),
             color="C0",
             alpha=0.25,
             label="Causal impact",

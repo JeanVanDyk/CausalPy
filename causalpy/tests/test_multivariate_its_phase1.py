@@ -12,14 +12,16 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 """
-Tests for Phase 1.1: Multivariate ITS Formula Handling
+Tests for Phase 1.1 and 1.2: Multivariate ITS Formula Handling and Data Structure
 
-Tests the extension of InterruptedTimeSeries to accept and parse multiple formulas.
+Tests the extension of InterruptedTimeSeries to accept and parse multiple formulas,
+and the data structure changes for multivariate outcomes.
 """
 
 import numpy as np
 import pandas as pd
 import pytest
+import xarray as xr
 from sklearn.linear_model import LinearRegression
 
 import causalpy as cp
@@ -232,3 +234,136 @@ def test_formula_stored_correctly(simple_data):
         model=LinearRegression(),
     )
     assert result.formula == formula_list
+
+
+# Phase 1.2 Tests: Data Structure
+
+
+def test_pre_y_has_outcomes_dimension(simple_data):
+    """Test that pre_y has 'outcomes' dimension with correct shape."""
+    treatment_time = pd.Timestamp("2022-01-01")
+
+    result = cp.InterruptedTimeSeries(
+        simple_data,
+        treatment_time,
+        formula=["y1 ~ 1 + t", "y2 ~ 1 + t"],
+        model=LinearRegression(),
+    )
+
+    # Check pre_y structure
+    assert "outcomes" in result.pre_y.dims
+    assert "obs_ind" in result.pre_y.dims
+    assert result.pre_y.shape == (len(result.datapre), 2)  # (n_obs, n_outcomes)
+    assert list(result.pre_y.coords["outcomes"].values) == ["y1", "y2"]
+
+
+def test_post_y_has_outcomes_dimension(simple_data):
+    """Test that post_y has 'outcomes' dimension with correct shape."""
+    treatment_time = pd.Timestamp("2022-01-01")
+
+    result = cp.InterruptedTimeSeries(
+        simple_data,
+        treatment_time,
+        formula=["y1 ~ 1 + t", "y2 ~ 1 + t"],
+        model=LinearRegression(),
+    )
+
+    # Check post_y structure
+    assert "outcomes" in result.post_y.dims
+    assert "obs_ind" in result.post_y.dims
+    assert result.post_y.shape == (len(result.datapost), 2)  # (n_post_obs, n_outcomes)
+    assert list(result.post_y.coords["outcomes"].values) == ["y1", "y2"]
+
+
+def test_pre_X_is_list_of_dataarrays(simple_data):
+    """Test that pre_X is a list of DataArrays, one per outcome."""
+    treatment_time = pd.Timestamp("2022-01-01")
+
+    result = cp.InterruptedTimeSeries(
+        simple_data,
+        treatment_time,
+        formula=["y1 ~ 1 + t", "y2 ~ 1 + t"],
+        model=LinearRegression(),
+    )
+
+    # Check pre_X structure
+    assert isinstance(result.pre_X, list)
+    assert len(result.pre_X) == 2  # One per outcome
+    assert all(isinstance(x, xr.DataArray) for x in result.pre_X)
+    assert all("obs_ind" in x.dims for x in result.pre_X)
+    assert all("coeffs" in x.dims for x in result.pre_X)
+
+
+def test_post_X_is_list_of_dataarrays(simple_data):
+    """Test that post_X is a list of DataArrays, one per outcome."""
+    treatment_time = pd.Timestamp("2022-01-01")
+
+    result = cp.InterruptedTimeSeries(
+        simple_data,
+        treatment_time,
+        formula=["y1 ~ 1 + t", "y2 ~ 1 + t"],
+        model=LinearRegression(),
+    )
+
+    # Check post_X structure
+    assert isinstance(result.post_X, list)
+    assert len(result.post_X) == 2  # One per outcome
+    assert all(isinstance(x, xr.DataArray) for x in result.post_X)
+    assert all("obs_ind" in x.dims for x in result.post_X)
+    assert all("coeffs" in x.dims for x in result.post_X)
+
+
+def test_pre_X_different_predictors(simple_data):
+    """Test that pre_X can have different number of coefficients per outcome."""
+    treatment_time = pd.Timestamp("2022-01-01")
+
+    # Add a month variable
+    simple_data["month"] = simple_data.index.month
+
+    result = cp.InterruptedTimeSeries(
+        simple_data,
+        treatment_time,
+        formula=["y1 ~ 1 + t", "y2 ~ 1 + t + C(month)"],
+        model=LinearRegression(),
+    )
+
+    # Check that X arrays have different number of coefficients
+    assert result.pre_X[0].shape[1] < result.pre_X[1].shape[1]
+    assert result.post_X[0].shape[1] < result.post_X[1].shape[1]
+
+
+def test_single_outcome_data_structure(simple_data):
+    """Test that single outcome case still works with new data structure."""
+    treatment_time = pd.Timestamp("2022-01-01")
+
+    result = cp.InterruptedTimeSeries(
+        simple_data,
+        treatment_time,
+        formula="y1 ~ 1 + t",
+        model=LinearRegression(),
+    )
+
+    # Check pre_y structure (should still have outcomes dimension)
+    assert "outcomes" in result.pre_y.dims
+    assert result.pre_y.shape == (len(result.datapre), 1)  # (n_obs, 1)
+    assert list(result.pre_y.coords["outcomes"].values) == ["y1"]
+
+    # Check pre_X is still a list (with one element)
+    assert isinstance(result.pre_X, list)
+    assert len(result.pre_X) == 1
+    assert isinstance(result.pre_X[0], xr.DataArray)
+
+
+def test_outcome_variable_names_stored(simple_data):
+    """Test that outcome variable names are stored correctly."""
+    treatment_time = pd.Timestamp("2022-01-01")
+
+    result = cp.InterruptedTimeSeries(
+        simple_data,
+        treatment_time,
+        formula=["y1 ~ 1 + t", "y2 ~ 1 + t"],
+        model=LinearRegression(),
+    )
+
+    assert result.outcome_variable_names == ["y1", "y2"]
+    assert len(result.outcome_variable_names) == len(result.formula)
