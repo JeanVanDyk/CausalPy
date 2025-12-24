@@ -25,7 +25,7 @@ from matplotlib import pyplot as plt
 from patsy import build_design_matrices, dmatrices
 from sklearn.base import RegressorMixin
 
-from causalpy.custom_exceptions import BadIndexException
+from causalpy.custom_exceptions import BadIndexException, FormulaException
 from causalpy.date_utils import _combine_datetime_indices, format_date_axes
 from causalpy.plot_utils import get_hdi_to_df, plot_xY
 from causalpy.pymc_models import PyMCModel
@@ -55,8 +55,9 @@ class InterruptedTimeSeries(BaseExperiment):
         Must match the index type (DatetimeIndex requires pd.Timestamp).
         **INCLUSIVE**: Observations at exactly ``treatment_time`` are included in the
         post-intervention period (uses ``>=`` comparison).
-    formula : str
+    formula : str | list[str]
         A statistical model formula using patsy syntax (e.g., "y ~ 1 + t + C(month)").
+        For multivariate outcomes, provide a list of formulas, one per outcome variable.
     model : Union[PyMCModel, RegressorMixin], optional
         A PyMC (Bayesian) or sklearn (OLS) model. If None, defaults to a PyMC
         LinearRegression model.
@@ -133,7 +134,7 @@ class InterruptedTimeSeries(BaseExperiment):
         self,
         data: pd.DataFrame,
         treatment_time: int | float | pd.Timestamp,
-        formula: str,
+        formula: str | list[str],
         model: PyMCModel | RegressorMixin | None = None,
         treatment_end_time: int | float | pd.Timestamp | None = None,
         **kwargs: dict,
@@ -143,7 +144,10 @@ class InterruptedTimeSeries(BaseExperiment):
         self.post_y: xr.DataArray
         # rename the index to "obs_ind"
         data.index.name = "obs_ind"
-        self.input_validation(data, treatment_time, treatment_end_time)
+        # Validate formula type
+        self.input_validation(data, treatment_time, treatment_end_time, formula)
+        # Normalize formula: if string, convert to list, else keep as is
+        self.formula = [formula] if isinstance(formula, str) else formula
         self.treatment_time = treatment_time
         self.treatment_end_time = treatment_end_time
         # set experiment type - usually done in subclasses
@@ -155,18 +159,31 @@ class InterruptedTimeSeries(BaseExperiment):
         self.datapre = data[data.index < self.treatment_time]
         self.datapost = data[data.index >= self.treatment_time]
 
-        self.formula = formula
+        # Parse each formula using dmatrices() from patsy
+        self._y_design_info_list: list = []
+        self._x_design_info_list: list = []
+        self.outcome_variable_names: list[str] = []
 
-        # set things up with pre-intervention data
-        y, X = dmatrices(formula, self.datapre)
-        self.outcome_variable_name = y.design_info.column_names[0]
-        self._y_design_info = y.design_info
-        self._x_design_info = X.design_info
-        self.labels = X.design_info.column_names
+        for f in self.formula:
+            try:
+                y, X = dmatrices(f, self.datapre)
+            except Exception as e:
+                raise FormulaException(f"Error parsing formula '{f}': {str(e)}") from e
+
+            # Store design info objects
+            self._y_design_info_list.append(y.design_info)
+            self._x_design_info_list.append(X.design_info)
+
+            # Store outcome variable name
+            outcome_name = y.design_info.column_names[0]
+            self.outcome_variable_names.append(outcome_name)
+
+        # Parse first formula for pre-intervention data (Phase 1.2 will handle multivariate properly)
+        y, X = dmatrices(self.formula[0], self.datapre)
         self.pre_y, self.pre_X = np.asarray(y), np.asarray(X)
         # process post-intervention data
         (new_y, new_x) = build_design_matrices(
-            [self._y_design_info, self._x_design_info], self.datapost
+            [self._y_design_info_list[0], self._x_design_info_list[0]], self.datapost
         )
         self.post_X = np.asarray(new_x)
         self.post_y = np.asarray(new_y)
@@ -176,7 +193,7 @@ class InterruptedTimeSeries(BaseExperiment):
             dims=["obs_ind", "coeffs"],
             coords={
                 "obs_ind": self.datapre.index,
-                "coeffs": self.labels,
+                "coeffs": self._x_design_info_list[0].column_names,
             },
         )
         self.pre_y = xr.DataArray(
@@ -189,7 +206,7 @@ class InterruptedTimeSeries(BaseExperiment):
             dims=["obs_ind", "coeffs"],
             coords={
                 "obs_ind": self.datapost.index,
-                "coeffs": self.labels,
+                "coeffs": self._x_design_info_list[0].column_names,
             },
         )
         self.post_y = xr.DataArray(
@@ -202,7 +219,7 @@ class InterruptedTimeSeries(BaseExperiment):
         # All PyMC models now accept xr.DataArray with consistent API
         if isinstance(self.model, PyMCModel):
             COORDS: dict[str, Any] = {
-                "coeffs": self.labels,
+                "coeffs": self._x_design_info_list[0].column_names,
                 "obs_ind": np.arange(self.pre_X.shape[0]),
                 "treated_units": ["unit_0"],
                 "datetime_index": self.datapre.index,  # For time series models
@@ -258,8 +275,36 @@ class InterruptedTimeSeries(BaseExperiment):
         data: pd.DataFrame,
         treatment_time: int | float | pd.Timestamp,
         treatment_end_time: int | float | pd.Timestamp | None = None,
+        formula: str | list[str] | None = None,
     ) -> None:
-        """Validate the input data and model formula for correctness"""
+        """Validate the input data and model formula for correctness
+
+        Parameters
+        ----------
+        data : pd.DataFrame
+            The input data
+        treatment_time : int | float | pd.Timestamp
+            The treatment time
+        treatment_end_time : int | float | pd.Timestamp | None, optional
+            The treatment end time, by default None
+        formula : str | list[str] | None, optional
+            The formula(s) to validate (can be a string or list of strings), by default None
+        """
+        # Validate formula input type
+        if formula is not None:
+            if not isinstance(formula, (str, list)):
+                raise FormulaException(
+                    f"Formula must be a string or list of strings, got {type(formula)}"
+                )
+            if isinstance(formula, list):
+                if not formula:
+                    raise FormulaException("Formula list cannot be empty")
+                if not all(isinstance(f, str) for f in formula):
+                    raise FormulaException(
+                        "All elements in formula list must be strings"
+                    )
+
+        # Validate data and treatment time compatibility
         if isinstance(data.index, pd.DatetimeIndex) and not isinstance(
             treatment_time, pd.Timestamp
         ):
